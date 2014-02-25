@@ -26,7 +26,7 @@
  **************************************************************************/
 
 #include "vmwgfx_drv.h"
-#include "vmwgfx_drm.h"
+#include <drm/vmwgfx_drm.h>
 #include "vmwgfx_kms.h"
 
 int vmw_getparam_ioctl(struct drm_device *dev, void *data,
@@ -53,7 +53,7 @@ int vmw_getparam_ioctl(struct drm_device *dev, void *data,
 		param->value = dev_priv->fifo.capabilities;
 		break;
 	case DRM_VMW_PARAM_MAX_FB_SIZE:
-		param->value = dev_priv->vram_size;
+		param->value = dev_priv->prim_bb_mem;
 		break;
 	case DRM_VMW_PARAM_FIFO_HW_VERSION:
 	{
@@ -68,6 +68,20 @@ int vmw_getparam_ioctl(struct drm_device *dev, void *data,
 				  SVGA_FIFO_3D_HWVERSION));
 		break;
 	}
+	case DRM_VMW_PARAM_MAX_SURF_MEMORY:
+		param->value = dev_priv->memory_size;
+		break;
+	case DRM_VMW_PARAM_3D_CAPS_SIZE:
+		if (dev_priv->capabilities & SVGA_CAP_GBOBJECTS)
+			param->value = SVGA3D_DEVCAP_MAX;
+		else
+			param->value = (SVGA_FIFO_3D_CAPS_LAST -
+					SVGA_FIFO_3D_CAPS + 1);
+		param->value *= sizeof(uint32_t);
+		break;
+	case DRM_VMW_PARAM_MAX_MOB_MEMORY:
+		param->value = dev_priv->max_mob_pages * PAGE_SIZE;
+		break;
 	default:
 		DRM_ERROR("Illegal vmwgfx get param request: %d\n",
 			  param->param);
@@ -89,13 +103,19 @@ int vmw_get_cap_3d_ioctl(struct drm_device *dev, void *data,
 	void __user *buffer = (void __user *)((unsigned long)(arg->buffer));
 	void *bounce;
 	int ret;
+	bool gb_objects = !!(dev_priv->capabilities & SVGA_CAP_GBOBJECTS);
 
 	if (unlikely(arg->pad64 != 0)) {
 		DRM_ERROR("Illegal GET_3D_CAP argument.\n");
 		return -EINVAL;
 	}
 
-	size = (SVGA_FIFO_3D_CAPS_LAST - SVGA_FIFO_3D_CAPS + 1) << 2;
+	if (gb_objects)
+		size = SVGA3D_DEVCAP_MAX;
+	else
+		size = (SVGA_FIFO_3D_CAPS_LAST - SVGA_FIFO_3D_CAPS + 1);
+
+	size *= sizeof(uint32_t);
 
 	if (arg->max_size < size)
 		size = arg->max_size;
@@ -106,10 +126,26 @@ int vmw_get_cap_3d_ioctl(struct drm_device *dev, void *data,
 		return -ENOMEM;
 	}
 
-	fifo_mem = dev_priv->mmio_virt;
-	memcpy_fromio(bounce, &fifo_mem[SVGA_FIFO_3D_CAPS], size);
+	if (gb_objects) {
+		int i;
+		uint32_t *bounce32 = (uint32_t *) bounce;
+
+		mutex_lock(&dev_priv->hw_mutex);
+		for (i = 0; i < SVGA3D_DEVCAP_MAX; ++i) {
+			vmw_write(dev_priv, SVGA_REG_DEV_CAP, i);
+			*bounce32++ = vmw_read(dev_priv, SVGA_REG_DEV_CAP);
+		}
+		mutex_unlock(&dev_priv->hw_mutex);
+
+	} else {
+
+		fifo_mem = dev_priv->mmio_virt;
+		memcpy_fromio(bounce, &fifo_mem[SVGA_FIFO_3D_CAPS], size);
+	}
 
 	ret = copy_to_user(buffer, bounce, size);
+	if (ret)
+		ret = -EFAULT;
 	vfree(bounce);
 
 	if (unlikely(ret != 0))
@@ -129,8 +165,9 @@ int vmw_present_ioctl(struct drm_device *dev, void *data,
 	struct vmw_master *vmaster = vmw_master(file_priv->master);
 	struct drm_vmw_rect __user *clips_ptr;
 	struct drm_vmw_rect *clips = NULL;
-	struct drm_mode_object *obj;
+	struct drm_framebuffer *fb;
 	struct vmw_framebuffer *vfb;
+	struct vmw_resource *res;
 	uint32_t num_clips;
 	int ret;
 
@@ -160,29 +197,27 @@ int vmw_present_ioctl(struct drm_device *dev, void *data,
 		goto out_no_copy;
 	}
 
-	ret = mutex_lock_interruptible(&dev->mode_config.mutex);
-	if (unlikely(ret != 0)) {
-		ret = -ERESTARTSYS;
-		goto out_no_mode_mutex;
-	}
+	drm_modeset_lock_all(dev);
 
-	obj = drm_mode_object_find(dev, arg->fb_id, DRM_MODE_OBJECT_FB);
-	if (!obj) {
+	fb = drm_framebuffer_lookup(dev, arg->fb_id);
+	if (!fb) {
 		DRM_ERROR("Invalid framebuffer id.\n");
-		ret = -EINVAL;
+		ret = -ENOENT;
 		goto out_no_fb;
 	}
-	vfb = vmw_framebuffer_to_vfb(obj_to_fb(obj));
+	vfb = vmw_framebuffer_to_vfb(fb);
 
 	ret = ttm_read_lock(&vmaster->lock, true);
 	if (unlikely(ret != 0))
 		goto out_no_ttm_lock;
 
-	ret = vmw_user_surface_lookup_handle(dev_priv, tfile, arg->sid,
-					     &surface);
+	ret = vmw_user_resource_lookup_handle(dev_priv, tfile, arg->sid,
+					      user_surface_converter,
+					      &res);
 	if (ret)
 		goto out_no_surface;
 
+	surface = vmw_res_to_srf(res);
 	ret = vmw_kms_present(dev_priv, file_priv,
 			      vfb, surface, arg->sid,
 			      arg->dest_x, arg->dest_y,
@@ -194,9 +229,9 @@ int vmw_present_ioctl(struct drm_device *dev, void *data,
 out_no_surface:
 	ttm_read_unlock(&vmaster->lock);
 out_no_ttm_lock:
+	drm_framebuffer_unreference(fb);
 out_no_fb:
-	mutex_unlock(&dev->mode_config.mutex);
-out_no_mode_mutex:
+	drm_modeset_unlock_all(dev);
 out_no_copy:
 	kfree(clips);
 out_clips:
@@ -215,7 +250,7 @@ int vmw_present_readback_ioctl(struct drm_device *dev, void *data,
 	struct vmw_master *vmaster = vmw_master(file_priv->master);
 	struct drm_vmw_rect __user *clips_ptr;
 	struct drm_vmw_rect *clips = NULL;
-	struct drm_mode_object *obj;
+	struct drm_framebuffer *fb;
 	struct vmw_framebuffer *vfb;
 	uint32_t num_clips;
 	int ret;
@@ -246,24 +281,20 @@ int vmw_present_readback_ioctl(struct drm_device *dev, void *data,
 		goto out_no_copy;
 	}
 
-	ret = mutex_lock_interruptible(&dev->mode_config.mutex);
-	if (unlikely(ret != 0)) {
-		ret = -ERESTARTSYS;
-		goto out_no_mode_mutex;
-	}
+	drm_modeset_lock_all(dev);
 
-	obj = drm_mode_object_find(dev, arg->fb_id, DRM_MODE_OBJECT_FB);
-	if (!obj) {
+	fb = drm_framebuffer_lookup(dev, arg->fb_id);
+	if (!fb) {
 		DRM_ERROR("Invalid framebuffer id.\n");
-		ret = -EINVAL;
+		ret = -ENOENT;
 		goto out_no_fb;
 	}
 
-	vfb = vmw_framebuffer_to_vfb(obj_to_fb(obj));
+	vfb = vmw_framebuffer_to_vfb(fb);
 	if (!vfb->dmabuf) {
 		DRM_ERROR("Framebuffer not dmabuf backed.\n");
 		ret = -EINVAL;
-		goto out_no_fb;
+		goto out_no_ttm_lock;
 	}
 
 	ret = ttm_read_lock(&vmaster->lock, true);
@@ -276,9 +307,9 @@ int vmw_present_readback_ioctl(struct drm_device *dev, void *data,
 
 	ttm_read_unlock(&vmaster->lock);
 out_no_ttm_lock:
+	drm_framebuffer_unreference(fb);
 out_no_fb:
-	mutex_unlock(&dev->mode_config.mutex);
-out_no_mode_mutex:
+	drm_modeset_unlock_all(dev);
 out_no_copy:
 	kfree(clips);
 out_clips:
